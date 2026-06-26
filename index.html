@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Control de Acceso RFID</title>
+  <meta name="description" content="Sistema de control de acceso RFID en tiempo real">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="RFID Access">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getDatabase, ref, onValue, set, remove } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyBZcLAAscIfROKDshtcfSNuuyNOxlQljj0",
+      authDomain: "rfid-5a58c.firebaseapp.com",
+      databaseURL: "https://rfid-5a58c-default-rtdb.firebaseio.com",
+      projectId: "rfid-5a58c",
+      storageBucket: "rfid-5a58c.firebasestorage.app",
+      messagingSenderId: "356735785677",
+      appId: "1:356735785677:web:09d206072d443fa2c1e784"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    let tarjetas = {};
+    let historialLog = [];
+    let ultimaLectura = null;
+
+    // ── Escucha en tiempo real ─────────────────────────────────
+    onValue(ref(db, "/Tarjetas"), (snap) => {
+      tarjetas = snap.val() || {};
+      renderDashboard();
+      renderUsuarios();
+      actualizarEstadisticas();
+    });
+
+    onValue(ref(db, "/Lecturas"), (snap) => {
+      const uid = snap.val();
+      if (uid && uid !== ultimaLectura) {
+        ultimaLectura = uid;
+        const esConocido = tarjetas[uid];
+        const permitido = esConocido && tarjetas[uid].acceso === true;
+        historialLog.unshift({ uid, ts: Date.now(), nombre: esConocido?.nombre || null, permitido: !!permitido });
+        if (historialLog.length > 50) historialLog.pop();
+        renderDashboard();
+        renderLog();
+        actualizarEstadisticas();
+        mostrarToast(uid, permitido, esConocido?.nombre);
+      }
+    });
+
+    // ── Dashboard ──────────────────────────────────────────────
+    function renderDashboard() {
+      const uids = Object.keys(tarjetas);
+      const total = uids.length;
+      const activos = uids.filter(u => tarjetas[u].acceso === true).length;
+      const bloqueados = total - activos;
+      const denegados = historialLog.filter(e => !e.permitido).length;
+
+      document.getElementById("m-total").textContent = total;
+      document.getElementById("m-activos").textContent = activos;
+      document.getElementById("m-denegados").textContent = denegados;
+      document.getElementById("m-lecturas").textContent = historialLog.length;
+
+      const bar = document.getElementById("perm-bar");
+      if (total > 0) {
+        bar.innerHTML =
+          `<div style="flex:${activos};background:#22c55e;height:100%;border-radius:${bloqueados===0?'6px':'6px 0 0 6px'};min-width:${activos>0?'6px':'0'}"></div>` +
+          `<div style="flex:${bloqueados};background:#ef4444;height:100%;border-radius:${activos===0?'6px':'0 6px 6px 0'};min-width:${bloqueados>0?'6px':'0'}"></div>`;
+      } else {
+        bar.innerHTML = `<div style="flex:1;background:var(--bg3);height:100%;border-radius:6px"></div>`;
+      }
+      document.getElementById("perm-label").textContent =
+        total > 0 ? `${activos} con acceso · ${bloqueados} bloqueados` : "Sin tarjetas registradas";
+
+      const ultimoUID = ultimaLectura || "—";
+      const ultimoObj = ultimaLectura ? tarjetas[ultimaLectura] : null;
+      const ultimoOk = ultimoObj && ultimoObj.acceso === true;
+      document.getElementById("last-uid").textContent = ultimoUID;
+      document.getElementById("last-name").textContent = ultimoObj
+        ? ultimoObj.nombre
+        : ultimaLectura ? "No registrado" : "Sin lecturas";
+      const st = document.getElementById("last-status");
+      st.textContent = ultimaLectura ? (ultimoOk ? "Permitido" : "Denegado") : "";
+      st.className = ultimaLectura ? (ultimoOk ? "chip chip-ok" : "chip chip-deny") : "";
+
+      const mini = document.getElementById("mini-log");
+      if (historialLog.length === 0) {
+        mini.innerHTML = `<div class="empty-state"><span class="icon">📡</span><p>Esperando lecturas del ESP32...</p></div>`;
+      } else {
+        mini.innerHTML = historialLog.slice(0, 5).map(e => `
+          <div class="log-item">
+            <div class="log-dot ${e.permitido ? 'dot-ok' : 'dot-deny'}"></div>
+            <div class="log-info">
+              <span class="log-uid">${e.uid}</span>
+              <span class="log-sub">${e.nombre || "No registrado"}</span>
+            </div>
+            <div class="log-time">${timeAgo(e.ts)}</div>
+          </div>`).join("");
+      }
+    }
+
+    // ── Usuarios ───────────────────────────────────────────────
+    function renderUsuarios(filtro = "") {
+      const lista = document.getElementById("users-list");
+      const uids = Object.keys(tarjetas).filter(uid => {
+        const n = (tarjetas[uid].nombre || "").toLowerCase();
+        return n.includes(filtro.toLowerCase()) || uid.toLowerCase().includes(filtro.toLowerCase());
+      });
+
+      if (uids.length === 0) {
+        lista.innerHTML = `<div class="empty-state"><span class="icon">🪪</span><p>${filtro ? "Sin resultados" : "No hay tarjetas registradas"}</p></div>`;
+        return;
+      }
+
+      lista.innerHTML = uids.map(uid => {
+        const u = tarjetas[uid];
+        const ok = u.acceso === true;
+        const ini = (u.nombre || "?").slice(0, 2).toUpperCase();
+        return `<div class="user-card">
+          <div class="user-avatar ${ok ? 'av-ok' : 'av-deny'}">${ini}</div>
+          <div class="user-body">
+            <div class="user-name">${u.nombre || "Sin nombre"}</div>
+            <div class="user-uid">${uid}</div>
+          </div>
+          <div class="user-actions">
+            <button class="toggle-btn ${ok ? 'btn-deny' : 'btn-ok'}" onclick="window.toggleAcceso('${uid}', ${!ok})">
+              ${ok ? "Bloquear" : "Permitir"}
+            </button>
+            <button class="icon-btn" onclick="window.eliminarTarjeta('${uid}', '${u.nombre || uid}')">🗑</button>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    // ── Log ────────────────────────────────────────────────────
+    function renderLog() {
+      const lista = document.getElementById("log-list");
+      if (historialLog.length === 0) {
+        lista.innerHTML = `<div class="empty-state"><span class="icon">📋</span><p>Sin registros aún</p></div>`;
+        return;
+      }
+      lista.innerHTML = historialLog.map(e => `
+        <div class="log-card ${e.permitido ? 'log-ok' : 'log-deny'}">
+          <div class="log-icon-big">${e.permitido ? "✅" : "❌"}</div>
+          <div class="log-body">
+            <div class="log-name">${e.nombre || "Tarjeta no registrada"}</div>
+            <div class="log-uid-full">${e.uid}</div>
+            <div class="log-ts">${new Date(e.ts).toLocaleString("es-MX")}</div>
+          </div>
+          <div class="chip ${e.permitido ? 'chip-ok' : 'chip-deny'}">${e.permitido ? "OK" : "Denegado"}</div>
+        </div>`).join("");
+    }
+
+    // ── Estadísticas ───────────────────────────────────────────
+    function actualizarEstadisticas() {
+      const total = historialLog.length;
+      const ok = historialLog.filter(e => e.permitido).length;
+      const deny = total - ok;
+      document.getElementById("stat-ok").textContent = ok;
+      document.getElementById("stat-deny").textContent = deny;
+      document.getElementById("stat-total").textContent = total;
+      document.getElementById("stat-rate").textContent = total > 0
+        ? Math.round((ok / total) * 100) + "%" : "—";
+      if (total > 0) {
+        document.getElementById("bar-ok").style.width = Math.round((ok/total)*100) + "%";
+        document.getElementById("bar-deny").style.width = Math.round((deny/total)*100) + "%";
+      }
+    }
+
+    // ── Acciones Firebase ──────────────────────────────────────
+    window.toggleAcceso = async (uid, nuevoEstado) => {
+      await set(ref(db, `/Tarjetas/${uid}/acceso`), nuevoEstado);
+      mostrarToastSimple(nuevoEstado ? "✅ Acceso habilitado" : "🔒 Tarjeta bloqueada");
+    };
+
+    window.eliminarTarjeta = async (uid, nombre) => {
+      if (!confirm(`¿Eliminar a ${nombre}?`)) return;
+      await remove(ref(db, `/Tarjetas/${uid}`));
+      mostrarToastSimple("🗑 Tarjeta eliminada");
+    };
+
+    window.agregarTarjeta = async () => {
+      const uid = document.getElementById("new-uid").value.trim().toUpperCase();
+      const nombre = document.getElementById("new-nombre").value.trim();
+      if (!uid || !nombre) { mostrarToastSimple("⚠️ Completa UID y nombre"); return; }
+      if (!/^[0-9A-F]{8}$/.test(uid)) { mostrarToastSimple("⚠️ UID debe ser 8 caracteres (ej: F7ED1606)"); return; }
+      await set(ref(db, `/Tarjetas/${uid}`), { nombre, acceso: true });
+      document.getElementById("new-uid").value = "";
+      document.getElementById("new-nombre").value = "";
+      document.getElementById("add-form").style.display = "none";
+      mostrarToastSimple("✅ Tarjeta registrada");
+    };
+
+    // ── Toast ──────────────────────────────────────────────────
+    function mostrarToast(uid, permitido, nombre) {
+      const t = document.getElementById("toast");
+      t.innerHTML = `<span class="toast-icon">${permitido ? "✅" : "❌"}</span>
+        <div><div class="toast-title">${permitido ? "Acceso permitido" : "Acceso denegado"}</div>
+        <div class="toast-sub">${nombre || uid}</div></div>`;
+      t.className = "toast show " + (permitido ? "toast-ok" : "toast-deny");
+      clearTimeout(window._tt);
+      window._tt = setTimeout(() => { t.className = "toast"; }, 3500);
+    }
+
+    function mostrarToastSimple(msg) {
+      const t = document.getElementById("toast");
+      t.innerHTML = `<div class="toast-title">${msg}</div>`;
+      t.className = "toast show toast-info";
+      clearTimeout(window._tt);
+      window._tt = setTimeout(() => { t.className = "toast"; }, 2500);
+    }
+
+    // ── Navegación ─────────────────────────────────────────────
+    window.irTab = (tab) => {
+      document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+      document.querySelectorAll(".page").forEach(p => p.style.display = p.id === "page-" + tab ? "block" : "none");
+      document.getElementById("fab").classList.toggle("visible", tab === "users");
+      if (tab === "log") renderLog();
+      if (tab === "stats") actualizarEstadisticas();
+    };
+
+    window.toggleForm = () => {
+      const f = document.getElementById("add-form");
+      f.style.display = f.style.display === "none" ? "flex" : "none";
+    };
+
+    window.filtrarUsuarios = (v) => renderUsuarios(v);
+
+    window.limpiarLog = () => {
+      if (!confirm("¿Limpiar historial de lecturas?")) return;
+      historialLog = [];
+      renderLog(); renderDashboard(); actualizarEstadisticas();
+      mostrarToastSimple("🗑 Historial limpiado");
+    };
+
+    function timeAgo(ts) {
+      const d = Math.floor((Date.now() - ts) / 1000);
+      if (d < 60) return "hace " + d + "s";
+      if (d < 3600) return "hace " + Math.floor(d/60) + "m";
+      return new Date(ts).toLocaleTimeString("es-MX", {hour:"2-digit", minute:"2-digit"});
+    }
+
+    renderDashboard(); renderLog(); actualizarEstadisticas();
+
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+    }
+  </script>
+
+  <style>
+    :root {
+      --bg: #0f1117; --bg2: #1a1b23; --bg3: #23242f; --card: #1e1f2b;
+      --border: rgba(255,255,255,0.08); --text: #f0f0f5; --text2: #9394a5;
+      --accent: #6c63ff; --ok: #22c55e; --deny: #ef4444; --warn: #f59e0b;
+      --radius: 14px; --radius-sm: 8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; overscroll-behavior: none; padding-bottom: 80px; }
+
+    .topbar { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 16px 20px 12px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 50; }
+    .topbar-left { display: flex; align-items: center; gap: 10px; }
+    .topbar-icon { width: 34px; height: 34px; background: var(--accent); border-radius: 9px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+    .topbar-title { font-size: 17px; font-weight: 600; }
+    .topbar-sub { font-size: 11px; color: var(--text2); margin-top: 1px; }
+    .live-dot { width: 8px; height: 8px; background: var(--ok); border-radius: 50%; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(.85)} }
+
+    .page { padding: 16px; display: none; }
+    #page-dashboard { display: block; }
+
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .metric-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+    .metric-label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+    .metric-value { font-size: 30px; font-weight: 700; }
+    .mv-accent { color: var(--accent); } .mv-ok { color: var(--ok); } .mv-deny { color: var(--deny); } .mv-warn { color: var(--warn); }
+
+    .perm-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 14px; }
+    .perm-title { font-size: 13px; color: var(--text2); margin-bottom: 10px; }
+    .perm-bar-wrap { height: 8px; background: var(--bg3); border-radius: 6px; overflow: hidden; display: flex; }
+    .perm-bar-label { font-size: 12px; color: var(--text2); margin-top: 8px; }
+
+    .last-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 14px; display: flex; align-items: center; gap: 14px; }
+    .last-icon { font-size: 28px; }
+    .last-uid { font-family: 'Courier New', monospace; font-size: 15px; font-weight: 600; letter-spacing: 1px; }
+    .last-name { font-size: 12px; color: var(--text2); margin-top: 2px; }
+
+    .chip { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 99px; display: inline-block; }
+    .chip-ok { background: rgba(34,197,94,.15); color: var(--ok); }
+    .chip-deny { background: rgba(239,68,68,.15); color: var(--deny); }
+
+    .section-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .section-title { font-size: 14px; font-weight: 600; }
+    .section-action { font-size: 12px; color: var(--accent); background: none; border: none; cursor: pointer; padding: 4px 0; }
+
+    #mini-log { display: flex; flex-direction: column; gap: 2px; }
+    .log-item { display: flex; align-items: center; gap: 10px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+    .log-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .dot-ok { background: var(--ok); } .dot-deny { background: var(--deny); }
+    .log-info { flex: 1; min-width: 0; }
+    .log-uid { font-family: 'Courier New', monospace; font-size: 13px; font-weight: 600; display: block; }
+    .log-sub { font-size: 11px; color: var(--text2); display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log-time { font-size: 11px; color: var(--text2); flex-shrink: 0; }
+
+    .search-bar { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; color: var(--text); font-size: 14px; width: 100%; margin-bottom: 12px; outline: none; }
+    .search-bar::placeholder { color: var(--text2); }
+    .search-bar:focus { border-color: var(--accent); }
+
+    .add-form { display: none; background: var(--card); border: 1px solid var(--accent); border-radius: var(--radius); padding: 14px; margin-bottom: 12px; flex-direction: column; gap: 10px; }
+    .add-form input { background: var(--bg3); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; color: var(--text); font-size: 14px; width: 100%; outline: none; }
+    .add-form input:focus { border-color: var(--accent); }
+    .add-form input::placeholder { color: var(--text2); }
+    .btn-primary { background: var(--accent); color: #fff; border: none; border-radius: var(--radius-sm); padding: 11px 16px; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; }
+    .btn-primary:active { opacity: .8; transform: scale(.98); }
+
+    #users-list { display: flex; flex-direction: column; gap: 8px; }
+    .user-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; display: flex; align-items: center; gap: 12px; }
+    .user-avatar { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; flex-shrink: 0; }
+    .av-ok { background: rgba(34,197,94,.15); color: var(--ok); }
+    .av-deny { background: rgba(239,68,68,.15); color: var(--deny); }
+    .user-body { flex: 1; min-width: 0; }
+    .user-name { font-size: 14px; font-weight: 600; }
+    .user-uid { font-family: 'Courier New', monospace; font-size: 11px; color: var(--text2); }
+    .user-actions { display: flex; gap: 6px; align-items: center; }
+    .toggle-btn { font-size: 12px; font-weight: 600; padding: 5px 10px; border-radius: var(--radius-sm); border: none; cursor: pointer; }
+    .btn-ok { background: rgba(34,197,94,.15); color: var(--ok); }
+    .btn-deny { background: rgba(239,68,68,.15); color: var(--deny); }
+    .icon-btn { background: none; border: none; font-size: 16px; cursor: pointer; padding: 4px; border-radius: 6px; }
+
+    #log-list { display: flex; flex-direction: column; gap: 8px; }
+    .log-card { background: var(--card); border-radius: var(--radius); padding: 12px 14px; display: flex; align-items: center; gap: 12px; border-left: 3px solid transparent; }
+    .log-ok { border-left-color: var(--ok); } .log-deny { border-left-color: var(--deny); }
+    .log-icon-big { font-size: 20px; flex-shrink: 0; }
+    .log-body { flex: 1; min-width: 0; }
+    .log-name { font-size: 14px; font-weight: 600; }
+    .log-uid-full { font-family: 'Courier New', monospace; font-size: 11px; color: var(--text2); }
+    .log-ts { font-size: 11px; color: var(--text2); margin-top: 2px; }
+
+    .stat-row { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 10px; }
+    .stat-icon { font-size: 22px; width: 32px; text-align: center; }
+    .stat-body { flex: 1; }
+    .stat-label { font-size: 12px; color: var(--text2); }
+    .stat-bar-outer { height: 5px; background: var(--bg3); border-radius: 3px; margin-top: 6px; }
+    .stat-bar-inner { height: 100%; border-radius: 3px; transition: width .5s ease; }
+    .stat-val { font-size: 20px; font-weight: 700; }
+
+    .bottomnav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg2); border-top: 1px solid var(--border); display: flex; padding: 8px 0 env(safe-area-inset-bottom, 8px); z-index: 100; }
+    .tab-btn { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; background: none; border: none; cursor: pointer; padding: 4px 0; color: var(--text2); font-size: 10px; transition: color .15s; }
+    .tab-btn .tab-icon { font-size: 22px; }
+    .tab-btn.active { color: var(--accent); }
+
+    .fab { position: fixed; bottom: 80px; right: 20px; width: 52px; height: 52px; background: var(--accent); border: none; border-radius: 50%; display: none; align-items: center; justify-content: center; font-size: 26px; color: #fff; box-shadow: 0 4px 20px rgba(108,99,255,.4); cursor: pointer; z-index: 90; }
+    .fab.visible { display: flex; }
+
+    .toast { position: fixed; top: -80px; left: 16px; right: 16px; background: var(--card); border-radius: var(--radius); padding: 12px 16px; display: flex; align-items: center; gap: 12px; transition: top .3s cubic-bezier(.34,1.56,.64,1); z-index: 200; border: 1px solid var(--border); }
+    .toast.show { top: calc(70px + env(safe-area-inset-top, 0px)); }
+    .toast-ok { border-color: var(--ok); } .toast-deny { border-color: var(--deny); } .toast-info { border-color: var(--accent); }
+    .toast-icon { font-size: 22px; }
+    .toast-title { font-size: 14px; font-weight: 600; }
+    .toast-sub { font-size: 12px; color: var(--text2); margin-top: 1px; }
+
+    .empty-state { text-align: center; padding: 32px 16px; color: var(--text2); }
+    .empty-state .icon { font-size: 36px; display: block; margin-bottom: 10px; }
+    .empty-state p { font-size: 14px; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <div class="topbar-icon">🔐</div>
+    <div>
+      <div class="topbar-title">Control RFID</div>
+      <div class="topbar-sub">rfid-5a58c · Tiempo real</div>
+    </div>
+  </div>
+  <div class="live-dot"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- DASHBOARD -->
+<div class="page" id="page-dashboard">
+  <div class="metrics">
+    <div class="metric-card">
+      <div class="metric-label">Registrados</div>
+      <div class="metric-value mv-accent" id="m-total">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Con acceso</div>
+      <div class="metric-value mv-ok" id="m-activos">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Denegados</div>
+      <div class="metric-value mv-deny" id="m-denegados">0</div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Lecturas</div>
+      <div class="metric-value mv-warn" id="m-lecturas">0</div>
+    </div>
+  </div>
+
+  <div class="perm-card">
+    <div class="perm-title">Distribución de permisos</div>
+    <div class="perm-bar-wrap" id="perm-bar"></div>
+    <div class="perm-bar-label" id="perm-label">Cargando...</div>
+  </div>
+
+  <div class="last-card">
+    <div class="last-icon">📡</div>
+    <div style="flex:1;min-width:0">
+      <div class="last-uid" id="last-uid">—</div>
+      <div class="last-name" id="last-name">Sin lecturas</div>
+    </div>
+    <span id="last-status"></span>
+  </div>
+
+  <div class="section-hdr">
+    <div class="section-title">Lecturas recientes</div>
+    <button class="section-action" onclick="irTab('log')">Ver todo →</button>
+  </div>
+  <div id="mini-log"></div>
+</div>
+
+<!-- USUARIOS -->
+<div class="page" id="page-users">
+  <input class="search-bar" type="search" placeholder="🔍 Buscar por nombre o UID..." oninput="filtrarUsuarios(this.value)">
+  <div id="add-form" class="add-form">
+    <input id="new-nombre" type="text" placeholder="Nombre del usuario (ej: Juan García)">
+    <input id="new-uid" type="text" placeholder="UID de la tarjeta (ej: F7ED1606)" maxlength="8" style="text-transform:uppercase">
+    <button class="btn-primary" onclick="agregarTarjeta()">✅ Registrar tarjeta</button>
+  </div>
+  <div id="users-list"></div>
+</div>
+
+<!-- LOG -->
+<div class="page" id="page-log">
+  <div class="section-hdr" style="margin-bottom:12px">
+    <div class="section-title">Historial de accesos</div>
+    <button class="section-action" onclick="limpiarLog()">Limpiar</button>
+  </div>
+  <div id="log-list"></div>
+</div>
+
+<!-- ESTADÍSTICAS -->
+<div class="page" id="page-stats">
+  <div class="section-hdr" style="margin-bottom:12px">
+    <div class="section-title">Estadísticas de sesión</div>
+  </div>
+  <div class="stat-row">
+    <div class="stat-icon">✅</div>
+    <div class="stat-body">
+      <div class="stat-label">Accesos permitidos</div>
+      <div class="stat-bar-outer"><div class="stat-bar-inner" id="bar-ok" style="background:var(--ok);width:0%"></div></div>
+    </div>
+    <div class="stat-val" style="color:var(--ok)" id="stat-ok">0</div>
+  </div>
+  <div class="stat-row">
+    <div class="stat-icon">❌</div>
+    <div class="stat-body">
+      <div class="stat-label">Accesos denegados</div>
+      <div class="stat-bar-outer"><div class="stat-bar-inner" id="bar-deny" style="background:var(--deny);width:0%"></div></div>
+    </div>
+    <div class="stat-val" style="color:var(--deny)" id="stat-deny">0</div>
+  </div>
+  <div class="perm-card" style="margin-top:4px">
+    <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+      <div>
+        <div class="perm-title">Total lecturas</div>
+        <div style="font-size:28px;font-weight:700;color:var(--warn)" id="stat-total">0</div>
+      </div>
+      <div style="text-align:right">
+        <div class="perm-title">Tasa de éxito</div>
+        <div style="font-size:28px;font-weight:700;color:var(--ok)" id="stat-rate">—</div>
+      </div>
+    </div>
+  </div>
+  <div class="perm-card" style="margin-top:4px">
+    <div class="perm-title">Base de datos conectada</div>
+    <div style="font-family:'Courier New',monospace;font-size:12px;color:var(--accent);margin-top:4px">rfid-5a58c-default-rtdb.firebaseio.com</div>
+    <div style="font-size:11px;color:var(--text2);margin-top:6px">Nodos: /Tarjetas · /Lecturas</div>
+    <div style="margin-top:10px;display:flex;gap:8px">
+      <span class="chip chip-ok">Conectado</span>
+      <span class="chip" style="background:rgba(108,99,255,.15);color:var(--accent)">Tiempo real</span>
+    </div>
+  </div>
+</div>
+
+<button class="fab" id="fab" onclick="toggleForm()" aria-label="Agregar tarjeta">＋</button>
+
+<nav class="bottomnav">
+  <button class="tab-btn active" data-tab="dashboard" onclick="irTab('dashboard')">
+    <span class="tab-icon">🏠</span>Dashboard
+  </button>
+  <button class="tab-btn" data-tab="users" onclick="irTab('users')">
+    <span class="tab-icon">👤</span>Usuarios
+  </button>
+  <button class="tab-btn" data-tab="log" onclick="irTab('log')">
+    <span class="tab-icon">📋</span>Registro
+  </button>
+  <button class="tab-btn" data-tab="stats" onclick="irTab('stats')">
+    <span class="tab-icon">📊</span>Stats
+  </button>
+</nav>
+
+</body>
+</html>
